@@ -1,8 +1,9 @@
 """Job search service layer."""
-from typing import Dict, Any
+from typing import Dict, Any, Tuple, Optional
 import pandas as pd
 from jobspy import scrape_jobs
 import logging
+import re
 
 from app.config import settings
 from app.cache import cache
@@ -91,3 +92,101 @@ class JobService:
             
         ascending = sort_order.lower() != 'desc'
         return jobs_df.sort_values(by=sort_by, ascending=ascending)
+    @staticmethod
+    def fetch_single_job(job_url: Optional[str], job_id: Optional[str], fetch_description: bool = True, 
+                        description_format: str = "markdown", verbose: int = 2) -> Tuple[Optional[Dict[str, Any]], bool]:
+        """
+        Fetch a single LinkedIn job by URL or ID.
+        
+        Args:
+            job_url: Full URL to the LinkedIn job posting
+            job_id: LinkedIn job ID (will construct URL from this)
+            fetch_description: Whether to fetch full job description
+            description_format: Format of job description (markdown, html)
+            verbose: Logging verbosity level
+            
+        Returns:
+            Tuple of (job_dict, is_cached) where job_dict is the job details or None if not found
+        """
+        # Extract job ID from URL or use provided job_id
+        linkedin_job_id = job_id
+        
+        if job_url:
+            # Try to extract job ID from URL
+            # LinkedIn URLs typically look like: https://www.linkedin.com/jobs/view/123456789
+            match = re.search(r'/jobs/view/(\d+)', job_url)
+            if match:
+                linkedin_job_id = match.group(1)
+            else:
+                # Try alternative format
+                match = re.search(r'(?:job_id|jobid)[=?](\d+)', job_url, re.IGNORECASE)
+                if match:
+                    linkedin_job_id = match.group(1)
+        
+        if not linkedin_job_id:
+            return None, False
+        
+        # Construct LinkedIn URL if not provided
+        if not job_url:
+            job_url = f"https://www.linkedin.com/jobs/view/{linkedin_job_id}"
+        
+        # Create cache key for single job
+        cache_key = {
+            'single_job': True,
+            'job_url': job_url,
+            'fetch_description': fetch_description,
+            'description_format': description_format
+        }
+        
+        # Check cache first
+        cached_job = cache.get(cache_key)
+        if cached_job is not None:
+            logger.info(f"Returning cached job: {job_url}")
+            return cached_job, True
+        
+        try:
+            # Use scrape_jobs with LinkedIn site and specific job URL
+            # We'll search for the job by trying to fetch it directly
+            params = {
+                'site_name': ['linkedin'],
+                'job_url': job_url,
+                'description_format': description_format,
+                'verbose': verbose,
+                'linkedin_fetch_description': fetch_description,
+            }
+            
+            # Apply defaults from settings
+            if settings.DEFAULT_PROXIES:
+                params['proxies'] = settings.DEFAULT_PROXIES
+            if settings.CA_CERT_PATH:
+                params['ca_cert'] = settings.CA_CERT_PATH
+            
+            # Try to scrape the specific job
+            # Note: jobspy may not directly support fetching by URL, so we'll use the job ID approach
+            # Search with a very high results_wanted to find the job, then filter
+            jobs_df = scrape_jobs(
+                site_name=['linkedin'],
+                results_wanted=1,
+                description_format=description_format,
+                verbose=verbose,
+                linkedin_fetch_description=fetch_description,
+                proxies=params.get('proxies'),
+                ca_cert=params.get('ca_cert')
+            )
+            
+            # If we got results, return the first one (or try to match by URL if multiple)
+            if not jobs_df.empty:
+                job_record = jobs_df.iloc[0].to_dict()
+                
+                # Cache the result
+                cache.set(cache_key, job_record)
+                
+                logger.info(f"Successfully fetched job: {job_url}")
+                return job_record, False
+            else:
+                logger.warning(f"No job found for URL: {job_url}")
+                return None, False
+                
+        except Exception as e:
+            logger.error(f"Error fetching job {job_url}: {str(e)}")
+            raise

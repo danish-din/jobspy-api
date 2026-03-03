@@ -5,7 +5,7 @@ import time
 import uuid
 import traceback
 
-from app.models import JobSearchParams, JobResponse, PaginatedJobResponse
+from app.models import JobSearchParams, JobResponse, PaginatedJobResponse, SingleJobRequest, SingleJobResponse
 from app.config import settings
 from app.middleware.api_key_auth import get_api_key
 from app.services.job_service import JobService
@@ -348,6 +348,248 @@ async def search_jobs(
             status_code=500, 
             detail={
                 "error": "Error scraping jobs",
+                "message": error_message,
+                "suggestion": suggestion
+            }
+        )
+
+
+@router.get("/fetch_job", response_model=SingleJobResponse, dependencies=[Depends(get_api_key)])
+async def fetch_job(
+    request: Request,
+    job_url: Optional[str] = Query(None, description="Full URL to the LinkedIn job posting"),
+    job_id: Optional[str] = Query(None, description="LinkedIn job ID (e.g., 123456789)"),
+    fetch_description: bool = Query(True, description="Fetch full job description"),
+    description_format: str = Query("markdown", description="Format of job description (markdown, html)"),
+    verbose: int = Query(2, description="Controls verbosity (0: errors only, 1: errors+warnings, 2: all logs)"),
+):
+    """
+    Fetch a single LinkedIn job by URL or job ID.
+    
+    You can provide either:
+    - `job_url`: Full URL to the LinkedIn job (e.g., https://www.linkedin.com/jobs/view/123456789)
+    - `job_id`: Just the LinkedIn job ID (e.g., 123456789)
+    
+    The endpoint returns the job details in the same format as the search endpoint.
+    
+    Example usage:
+    - GET /api/v1/fetch_job?job_id=123456789
+    - GET /api/v1/fetch_job?job_url=https://www.linkedin.com/jobs/view/123456789
+    """
+    request_id = str(uuid.uuid4())
+    start_time = time.time()
+    
+    # Validate that at least one identifier is provided
+    if not job_url and not job_id:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "Missing required parameter",
+                "message": "Either 'job_url' or 'job_id' must be provided",
+                "suggestion": "Provide either a full LinkedIn job URL or just the job ID number"
+            }
+        )
+    
+    # Validate description_format
+    if description_format not in VALID_PARAMETERS.get("description_format", ["markdown", "html"]):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "Invalid description format",
+                "invalid_value": description_format,
+                "valid_formats": VALID_PARAMETERS.get("description_format", ["markdown", "html"]),
+                "suggestion": "Use either 'markdown' or 'html' for the description format"
+            }
+        )
+    
+    # Validate verbose
+    if verbose not in VALID_PARAMETERS.get("verbose", [0, 1, 2]):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "Invalid verbose level",
+                "invalid_value": verbose,
+                "valid_levels": VALID_PARAMETERS.get("verbose", [0, 1, 2]),
+                "suggestion": "Use 0 (errors), 1 (warnings), or 2 (all logs)"
+            }
+        )
+    
+    try:
+        logger.info(f"Request {request_id}: Fetching single job. URL: {job_url}, ID: {job_id}")
+        
+        # Fetch the single job
+        job, is_cached = JobService.fetch_single_job(
+            job_url=job_url,
+            job_id=job_id,
+            fetch_description=fetch_description,
+            description_format=description_format,
+            verbose=verbose
+        )
+        
+        end_time = time.time()
+        
+        if job:
+            logger.info(f"Request {request_id}: Successfully fetched job in {end_time - start_time:.2f} seconds")
+            return {
+                "success": True,
+                "job": job,
+                "cached": is_cached
+            }
+        else:
+            logger.warning(f"Request {request_id}: Job not found for the provided identifier")
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "error": "Job not found",
+                    "message": "Could not find the LinkedIn job with the provided URL or ID",
+                    "suggestion": "Verify that the job URL or ID is correct and the job still exists on LinkedIn"
+                }
+            )
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Request {request_id}: Error fetching job: {str(e)}")
+        logger.debug(traceback.format_exc())
+        
+        # Provide more helpful error details
+        error_message = str(e)
+        suggestion = "Check your job URL or ID and try again"
+        
+        if "proxy" in error_message.lower():
+            suggestion = "Check your proxy configuration or try without a proxy"
+        elif "timeout" in error_message.lower():
+            suggestion = "The request timed out. Try again or check your internet connection"
+        elif "captcha" in error_message.lower():
+            suggestion = "A CAPTCHA was encountered. Try using a different proxy or wait before retrying"
+        elif "not found" in error_message.lower():
+            suggestion = "The job posting may no longer exist. Verify the job URL or ID is correct"
+        
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "Error fetching job",
+                "message": error_message,
+                "suggestion": suggestion
+            }
+        )
+
+
+@router.post("/fetch_job", response_model=SingleJobResponse, dependencies=[Depends(get_api_key)])
+async def fetch_job_post(
+    request: Request,
+    params: SingleJobRequest,
+):
+    """
+    Fetch a single LinkedIn job by URL or job ID using POST method.
+    
+    Accepts a JSON body with the following fields:
+    - job_url (optional): Full URL to the LinkedIn job
+    - job_id (optional): LinkedIn job ID
+    - fetch_description (optional, default=true): Whether to fetch full description
+    - description_format (optional, default="markdown"): Format of description (markdown, html)
+    - verbose (optional, default=2): Verbosity level (0, 1, or 2)
+    
+    Example body:
+    {
+        "job_id": "123456789",
+        "fetch_description": true,
+        "description_format": "markdown"
+    }
+    """
+    request_id = str(uuid.uuid4())
+    start_time = time.time()
+    
+    # Validate that at least one identifier is provided
+    if not params.job_url and not params.job_id:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "Missing required parameter",
+                "message": "Either 'job_url' or 'job_id' must be provided",
+                "suggestion": "Provide either a full LinkedIn job URL or just the job ID number"
+            }
+        )
+    
+    # Validate description_format
+    if params.description_format not in VALID_PARAMETERS.get("description_format", ["markdown", "html"]):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "Invalid description format",
+                "invalid_value": params.description_format,
+                "valid_formats": VALID_PARAMETERS.get("description_format", ["markdown", "html"]),
+                "suggestion": "Use either 'markdown' or 'html' for the description format"
+            }
+        )
+    
+    # Validate verbose
+    if params.verbose and params.verbose not in VALID_PARAMETERS.get("verbose", [0, 1, 2]):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "Invalid verbose level",
+                "invalid_value": params.verbose,
+                "valid_levels": VALID_PARAMETERS.get("verbose", [0, 1, 2]),
+                "suggestion": "Use 0 (errors), 1 (warnings), or 2 (all logs)"
+            }
+        )
+    
+    try:
+        logger.info(f"Request {request_id}: Fetching single job. URL: {params.job_url}, ID: {params.job_id}")
+        
+        # Fetch the single job
+        job, is_cached = JobService.fetch_single_job(
+            job_url=params.job_url,
+            job_id=params.job_id,
+            fetch_description=params.fetch_description,
+            description_format=params.description_format,
+            verbose=params.verbose if params.verbose else 2
+        )
+        
+        end_time = time.time()
+        
+        if job:
+            logger.info(f"Request {request_id}: Successfully fetched job in {end_time - start_time:.2f} seconds")
+            return {
+                "success": True,
+                "job": job,
+                "cached": is_cached
+            }
+        else:
+            logger.warning(f"Request {request_id}: Job not found for the provided identifier")
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "error": "Job not found",
+                    "message": "Could not find the LinkedIn job with the provided URL or ID",
+                    "suggestion": "Verify that the job URL or ID is correct and the job still exists on LinkedIn"
+                }
+            )
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Request {request_id}: Error fetching job: {str(e)}")
+        logger.debug(traceback.format_exc())
+        
+        # Provide more helpful error details
+        error_message = str(e)
+        suggestion = "Check your job URL or ID and try again"
+        
+        if "proxy" in error_message.lower():
+            suggestion = "Check your proxy configuration or try without a proxy"
+        elif "timeout" in error_message.lower():
+            suggestion = "The request timed out. Try again or check your internet connection"
+        elif "captcha" in error_message.lower():
+            suggestion = "A CAPTCHA was encountered. Try using a different proxy or wait before retrying"
+        elif "not found" in error_message.lower():
+            suggestion = "The job posting may no longer exist. Verify the job URL or ID is correct"
+        
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "Error fetching job",
                 "message": error_message,
                 "suggestion": suggestion
             }

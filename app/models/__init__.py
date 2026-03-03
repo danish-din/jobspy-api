@@ -1,6 +1,6 @@
 """Models for the JobSpy Docker API."""
 from .health_models import HealthCheck, DetailedHealthCheck
-from .job_models import JobSearchParams, JobResponse, PaginatedJobResponse
+from .job_models import JobSearchParams, JobResponse, PaginatedJobResponse, SingleJobRequest, SingleJobResponse
 
 # Re-export all models
 __all__ = [
@@ -8,5 +8,6 @@ __all__ = [
     "DetailedHealthCheck",
     "JobSearchParams", 
     "JobResponse", 
-    "PaginatedJobResponse"
-]
+    "PaginatedJobResponse",
+    "SingleJobRequest",
+    "SingleJobResponse"

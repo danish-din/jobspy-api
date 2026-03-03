@@ -40,3 +40,32 @@ class PaginatedJobResponse(BaseModel):
     cached: bool = False
     next_page: Optional[str] = None
     previous_page: Optional[str] = None
+class SingleJobRequest(BaseModel):
+    """Request model for fetching a single job by URL or ID"""
+    job_url: Optional[str] = Field(
+        default=None, 
+        description="Full URL to the LinkedIn job posting (e.g., https://www.linkedin.com/jobs/view/123456789)"
+    )
+    job_id: Optional[str] = Field(
+        default=None,
+        description="LinkedIn job ID (e.g., 123456789). Will construct LinkedIn URL from this."
+    )
+    fetch_description: bool = Field(
+        default=True,
+        description="Fetch full job description (slower but more complete)"
+    )
+    description_format: Optional[str] = Field(
+        default="markdown",
+        description="Format of job description (markdown, html)"
+    )
+    verbose: Optional[int] = Field(
+        default=2,
+        description="Controls verbosity (0: errors only, 1: errors+warnings, 2: all logs)"
+    )
+
+class SingleJobResponse(BaseModel):
+    """Response model for a single job"""
+    success: bool
+    job: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
+    cached: bool = False
