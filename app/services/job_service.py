@@ -99,7 +99,7 @@ class JobService:
     def fetch_single_job(job_url: Optional[str], job_id: Optional[str], fetch_description: bool = True, 
                         description_format: str = "markdown", verbose: int = 2) -> Tuple[Optional[Dict[str, Any]], bool]:
         """
-        Fetch a single LinkedIn job by URL or ID using direct page scraping.
+        Fetch a single LinkedIn job by URL or ID using JobSpy's scraper.
         
         Args:
             job_url: Full URL to the LinkedIn job posting
@@ -143,88 +143,41 @@ class JobService:
         try:
             logger.info(f"Fetching job {linkedin_job_id} from LinkedIn")
             
-            # Use requests to fetch the LinkedIn job page
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            }
+            # Use scrape_jobs to search LinkedIn
+            # We search for multiple results to increase chance of finding our target job
+            jobs_df = scrape_jobs(
+                site_name=['linkedin'],
+                results_wanted=25,
+                description_format=description_format,
+                verbose=verbose,
+                linkedin_fetch_description=fetch_description,
+                proxies=settings.DEFAULT_PROXIES if settings.DEFAULT_PROXIES else None,
+                ca_cert=settings.CA_CERT_PATH if settings.CA_CERT_PATH else None
+            )
             
-            response = requests.get(job_url, headers=headers, timeout=15)
-            response.raise_for_status()
-            
-            # Parse the HTML to find job details
-            soup = BeautifulSoup(response.content, 'html.parser')
-            
-            # LinkedIn embeds JSON-LD structured data in the page
-            script_tags = soup.find_all('script', type='application/ld+json')
-            
-            job_record = None
-            for script in script_tags:
-                try:
-                    data = json.loads(script.string)
-                    
-                    # Look for JobPosting schema
-                    if isinstance(data, dict) and data.get('@type') == 'JobPosting':
-                        job_record = {
-                            'job_id': linkedin_job_id,
-                            'site': 'linkedin',
-                            'job_url': job_url,
-                            'title': data.get('title', ''),
-                            'company': data.get('hiringOrganization', {}).get('name', '') if isinstance(data.get('hiringOrganization'), dict) else '',
-                            'location': data.get('jobLocation', {}).get('address', {}).get('addressLocality', '') if isinstance(data.get('jobLocation'), dict) else '',
-                            'description': data.get('description', '') if fetch_description else '',
-                            'date_posted': data.get('datePosted', ''),
-                            'employment_type': data.get('employmentType', ''),
-                        }
-                        
-                        if job_record['company'] and job_record['title']:
-                            logger.info(f"Found job posting in JSON-LD: {job_record['title']} at {job_record['company']}")
+            if not jobs_df.empty:
+                # Look for exact job ID match in the results
+                job_record = None
+                for idx, row in jobs_df.iterrows():
+                    returned_job_url = row.get('job_url', '')
+                    # Extract ID from returned URL
+                    match = re.search(r'/jobs/view/(\d+)', str(returned_job_url))
+                    if match:
+                        returned_id = match.group(1)
+                        if returned_id == linkedin_job_id:
+                            job_record = row.to_dict()
+                            logger.info(f"Found exact match for job ID {linkedin_job_id}")
                             break
-                except (json.JSONDecodeError, AttributeError, TypeError):
-                    continue
+                
+                if job_record:
+                    # Cache the result
+                    cache.set(cache_key, job_record)
+                    logger.info(f"Successfully fetched job {linkedin_job_id}")
+                    return job_record, False
             
-            # If we didn't find job data in JSON-LD, try to scrape from the page HTML
-            if not job_record:
-                logger.info(f"JSON-LD data not found, attempting HTML scraping for job {linkedin_job_id}")
-                
-                # Try to find job title
-                title_elem = soup.find('h1') or soup.find('h2', class_='jobs-details-main-content__job-title')
-                title = title_elem.text.strip() if title_elem else ''
-                
-                # Try to find company name
-                company_elem = soup.find('a', {'data-tracking-control-name': 'public_jobs_topcard-org-name'})
-                company = company_elem.text.strip() if company_elem else ''
-                
-                # Try to find location
-                location_elem = soup.find('span', class_='job-details-jobs-details-top-card__job-info-item-label')
-                location = location_elem.text.strip() if location_elem else ''
-                
-                # Get description if available
-                description_elem = soup.find('div', class_='show-more-less-html__markup')
-                description = description_elem.get_text() if description_elem else ''
-                
-                if title and company:
-                    job_record = {
-                        'job_id': linkedin_job_id,
-                        'site': 'linkedin',
-                        'job_url': job_url,
-                        'title': title,
-                        'company': company,
-                        'location': location,
-                        'description': description if fetch_description else '',
-                    }
-            
-            if job_record:
-                # Cache the result
-                cache.set(cache_key, job_record)
-                logger.info(f"Successfully fetched job {linkedin_job_id}")
-                return job_record, False
-            
-            logger.warning(f"Could not parse job data for ID {linkedin_job_id}")
+            logger.warning(f"Job ID {linkedin_job_id} not found in search results")
             return None, False
                 
-        except requests.exceptions.RequestException as e:
-            logger.error(f"HTTP error fetching job {linkedin_job_id}: {str(e)}")
-            return None, False
         except Exception as e:
             logger.error(f"Error fetching job {linkedin_job_id}: {str(e)}")
-            raise
+            return None, False
