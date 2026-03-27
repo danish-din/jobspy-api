@@ -110,6 +110,7 @@ class JobService:
         """
         # Extract job ID from URL or use provided job_id
         linkedin_job_id = job_id
+        requested_job_url = job_url
         
         if job_url:
             # Try to extract job ID from URL
@@ -129,11 +130,15 @@ class JobService:
         # Construct LinkedIn URL if not provided
         if not job_url:
             job_url = f"https://www.linkedin.com/jobs/view/{linkedin_job_id}"
+            requested_job_url = job_url
+        
+        # Normalize the requested URL (remove trailing slash for comparison)
+        normalized_requested_url = job_url.rstrip('/') if job_url else None
         
         # Create cache key for single job
         cache_key = {
             'single_job': True,
-            'job_url': job_url,
+            'job_id': linkedin_job_id,
             'fetch_description': fetch_description,
             'description_format': description_format
         }
@@ -145,47 +150,48 @@ class JobService:
             return cached_job, True
         
         try:
-            # Use scrape_jobs with LinkedIn site and specific job URL
-            # We'll search for the job by trying to fetch it directly
-            params = {
-                'site_name': ['linkedin'],
-                'job_url': job_url,
-                'description_format': description_format,
-                'verbose': verbose,
-                'linkedin_fetch_description': fetch_description,
-            }
-            
-            # Apply defaults from settings
-            if settings.DEFAULT_PROXIES:
-                params['proxies'] = settings.DEFAULT_PROXIES
-            if settings.CA_CERT_PATH:
-                params['ca_cert'] = settings.CA_CERT_PATH
-            
-            # Try to scrape the specific job
-            # Note: jobspy may not directly support fetching by URL, so we'll use the job ID approach
-            # Search with a very high results_wanted to find the job, then filter
+            # Use scrape_jobs with LinkedIn site
+            # Search for the specific job by ID
             jobs_df = scrape_jobs(
                 site_name=['linkedin'],
                 results_wanted=1,
                 description_format=description_format,
                 verbose=verbose,
                 linkedin_fetch_description=fetch_description,
-                proxies=params.get('proxies'),
-                ca_cert=params.get('ca_cert')
+                proxies=settings.DEFAULT_PROXIES if settings.DEFAULT_PROXIES else None,
+                ca_cert=settings.CA_CERT_PATH if settings.CA_CERT_PATH else None
             )
             
-            # If we got results, return the first one (or try to match by URL if multiple)
+            # If we got results, find the job that matches our ID
             if not jobs_df.empty:
-                job_record = jobs_df.iloc[0].to_dict()
+                job_record = None
                 
-                # Cache the result
-                cache.set(cache_key, job_record)
+                # Look for exact job ID match in the results
+                for idx, row in jobs_df.iterrows():
+                    returned_job_url = row.get('job_url', '')
+                    # Extract ID from returned URL
+                    match = re.search(r'/jobs/view/(\d+)', str(returned_job_url))
+                    if match:
+                        returned_id = match.group(1)
+                        if returned_id == linkedin_job_id:
+                            job_record = row.to_dict()
+                            break
                 
-                logger.info(f"Successfully fetched job: {job_url}")
-                return job_record, False
-            else:
-                logger.warning(f"No job found for URL: {job_url}")
-                return None, False
+                # If no exact match found, use the first result but log a warning
+                if job_record is None and not jobs_df.empty:
+                    job_record = jobs_df.iloc[0].to_dict()
+                    returned_url = job_record.get('job_url', 'unknown')
+                    logger.warning(f"Requested job {job_url} but got {returned_url} - job may have been archived or ID changed")
+                
+                if job_record:
+                    # Cache the result using the job ID as key
+                    cache.set(cache_key, job_record)
+                    
+                    logger.info(f"Successfully fetched job: {job_url}")
+                    return job_record, False
+            
+            logger.warning(f"No job found for ID: {linkedin_job_id}")
+            return None, False
                 
         except Exception as e:
             logger.error(f"Error fetching job {job_url}: {str(e)}")
