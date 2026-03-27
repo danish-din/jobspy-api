@@ -99,7 +99,10 @@ class JobService:
     def fetch_single_job(job_url: Optional[str], job_id: Optional[str], fetch_description: bool = True, 
                         description_format: str = "markdown", verbose: int = 2) -> Tuple[Optional[Dict[str, Any]], bool]:
         """
-        Fetch a single LinkedIn job by URL or ID using JobSpy's scraper.
+        Fetch a single LinkedIn job by extracting data from LinkedIn's guest job posting API.
+        
+        Uses the public endpoint: /jobs-guest/jobs/api/jobPosting/{JOB_ID}
+        which returns parseable HTML with job details.
         
         Args:
             job_url: Full URL to the LinkedIn job posting
@@ -115,7 +118,6 @@ class JobService:
         linkedin_job_id = job_id
         
         if job_url:
-            # Try to extract job ID from URL
             match = re.search(r'/jobs/view/(\d+)', job_url)
             if match:
                 linkedin_job_id = match.group(1)
@@ -123,10 +125,7 @@ class JobService:
         if not linkedin_job_id:
             return None, False
         
-        # Construct LinkedIn URL
-        job_url = f"https://www.linkedin.com/jobs/view/{linkedin_job_id}"
-        
-        # Create cache key for single job
+        # Create cache key
         cache_key = {
             'single_job': True,
             'job_id': linkedin_job_id,
@@ -141,43 +140,144 @@ class JobService:
             return cached_job, True
         
         try:
-            logger.info(f"Fetching job {linkedin_job_id} from LinkedIn")
+            # Use LinkedIn's public guest job posting API
+            api_url = f"https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/{linkedin_job_id}"
+            job_view_url = f"https://www.linkedin.com/jobs/view/{linkedin_job_id}"
             
-            # Use scrape_jobs to search LinkedIn
-            # We search for multiple results to increase chance of finding our target job
-            jobs_df = scrape_jobs(
-                site_name=['linkedin'],
-                results_wanted=25,
-                description_format=description_format,
-                verbose=verbose,
-                linkedin_fetch_description=fetch_description,
-                proxies=settings.DEFAULT_PROXIES if settings.DEFAULT_PROXIES else None,
-                ca_cert=settings.CA_CERT_PATH if settings.CA_CERT_PATH else None
-            )
+            logger.info(f"Fetching job {linkedin_job_id} from LinkedIn guest API: {api_url}")
             
-            if not jobs_df.empty:
-                # Look for exact job ID match in the results
-                job_record = None
-                for idx, row in jobs_df.iterrows():
-                    returned_job_url = row.get('job_url', '')
-                    # Extract ID from returned URL
-                    match = re.search(r'/jobs/view/(\d+)', str(returned_job_url))
-                    if match:
-                        returned_id = match.group(1)
-                        if returned_id == linkedin_job_id:
-                            job_record = row.to_dict()
-                            logger.info(f"Found exact match for job ID {linkedin_job_id}")
-                            break
+            headers = {
+                'authority': 'www.linkedin.com',
+                'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'accept-language': 'en-US,en;q=0.9',
+                'cache-control': 'max-age=0',
+                'upgrade-insecure-requests': '1',
+                'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            }
+            
+            response = requests.get(api_url, headers=headers, timeout=20)
+            response.raise_for_status()
+            
+            soup = BeautifulSoup(response.content, 'html.parser')
+            
+            # Extract job title
+            title = None
+            title_elem = soup.find('h2', class_='top-card-layout__title')
+            if title_elem:
+                title = title_elem.get_text(strip=True)
+            else:
+                title_elem = soup.find(class_='topcard__title')
+                if title_elem:
+                    title = title_elem.get_text(strip=True)
+            
+            # Extract company name
+            company = None
+            company_elem = soup.find('a', class_='topcard__org-name-link')
+            if company_elem:
+                company = company_elem.get_text(strip=True)
+            else:
+                company_elem = soup.find(class_='topcard__org-name')
+                if company_elem:
+                    company = company_elem.get_text(strip=True)
+            
+            # Extract location
+            location = None
+            location_elem = soup.find('span', class_='topcard__flavor--bullet')
+            if location_elem:
+                location = location_elem.get_text(strip=True)
+            else:
+                # Try all topcard__flavor spans
+                flavors = soup.find_all('span', class_='topcard__flavor')
+                for flavor in flavors:
+                    text = flavor.get_text(strip=True)
+                    # Location usually contains a comma or known location patterns
+                    if ',' in text or any(word in text.lower() for word in ['remote', 'hybrid', 'united', 'london', 'new york']):
+                        location = text
+                        break
+            
+            # Extract description
+            description = ''
+            if fetch_description:
+                desc_elem = soup.find('div', class_='show-more-less-html__markup')
+                if desc_elem:
+                    if description_format == 'html':
+                        description = str(desc_elem)
+                    else:
+                        description = desc_elem.get_text(separator='\n', strip=True)
+            
+            # Extract job criteria (employment type, seniority, industry, function)
+            job_type = None
+            seniority_level = None
+            industries = None
+            job_function = None
+            
+            criteria_items = soup.find_all('li', class_='description__job-criteria-item')
+            for item in criteria_items:
+                header = item.find('h3', class_='description__job-criteria-subheader')
+                value = item.find('span', class_='description__job-criteria-text')
+                if header and value:
+                    header_text = header.get_text(strip=True).lower()
+                    value_text = value.get_text(strip=True)
+                    if 'seniority' in header_text:
+                        seniority_level = value_text
+                    elif 'employment' in header_text:
+                        job_type = value_text
+                    elif 'industr' in header_text:
+                        industries = value_text
+                    elif 'function' in header_text:
+                        job_function = value_text
+            
+            # Extract posted time / number of applicants
+            posted_time = None
+            num_applicants = None
+            flavors = soup.find_all('span', class_='topcard__flavor--metadata')
+            for flavor in flavors:
+                text = flavor.get_text(strip=True)
+                if 'ago' in text.lower() or 'reposted' in text.lower():
+                    posted_time = text
+                elif 'applicant' in text.lower() or 'click' in text.lower():
+                    num_applicants = text
+            
+            # Extract company logo
+            company_logo = None
+            logo_elem = soup.find('img', class_='artdeco-entity-image')
+            if logo_elem:
+                company_logo = logo_elem.get('data-delayed-url') or logo_elem.get('src')
+            
+            if title or company:
+                job_record = {
+                    'job_id': linkedin_job_id,
+                    'site': 'linkedin',
+                    'job_url': job_view_url,
+                    'title': title or '',
+                    'company': company or '',
+                    'location': location or '',
+                    'description': description,
+                    'job_type': job_type,
+                    'seniority_level': seniority_level,
+                    'industries': industries,
+                    'job_function': job_function,
+                    'posted_time': posted_time,
+                    'num_applicants': num_applicants,
+                    'company_logo': company_logo,
+                }
                 
-                if job_record:
-                    # Cache the result
-                    cache.set(cache_key, job_record)
-                    logger.info(f"Successfully fetched job {linkedin_job_id}")
-                    return job_record, False
+                # Remove None values for cleaner output
+                job_record = {k: v for k, v in job_record.items() if v is not None}
+                
+                cache.set(cache_key, job_record)
+                logger.info(f"Successfully extracted job {linkedin_job_id}: {title} at {company}")
+                return job_record, False
             
-            logger.warning(f"Job ID {linkedin_job_id} not found in search results")
+            logger.warning(f"Could not extract job data for ID {linkedin_job_id}")
             return None, False
                 
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code == 404:
+                logger.warning(f"Job {linkedin_job_id} not found on LinkedIn (404)")
+            else:
+                logger.error(f"HTTP error fetching job {linkedin_job_id}: {str(e)}")
+            return None, False
         except Exception as e:
-            logger.error(f"Error fetching job {linkedin_job_id}: {str(e)}")
+            logger.error(f"Error extracting job {linkedin_job_id}: {str(e)}")
             return None, False
